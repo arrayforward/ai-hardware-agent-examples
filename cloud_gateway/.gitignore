@@ -1,0 +1,31 @@
+# Build outputs
+build/
+build-*/
+cmake-build-*/
+out/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# IDE
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+*.user
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated docs
+docs/_build/

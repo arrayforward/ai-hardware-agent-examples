@@ -1,3 +1,14 @@
 .vscode
 .claude
 build_ws63/
+build/
+cloud_gateway/build/
+*.o
+*.obj
+*.exe
+*.a
+*.so
+*.dll
+*.dylib
+*.gcno
+*.gcda
