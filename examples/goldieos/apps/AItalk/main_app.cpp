@@ -1,3 +1,4 @@
+#include "aitalk_core.h"
 #include "main_ui.h"
 extern "C" {
 #include "goldie_osal.h"
@@ -50,46 +51,23 @@ extern "C" {
 static WifiService* wifi_service = NULL;
 static EventService* mevtservice = NULL;
 
-static goldie_mutex msgque_mutex;
-#define MAX_CHAT_MSG_LEN 1500
-
 static void *task_handle = NULL;
 static int running_flag = 0;
 static char init_flag = 0;
 static char thread_running_status = 0;
 static Goldie_Thread* play_thread;
 
-enum {
-    PLAY_TYPE_SILENCE = 0,
-    PLAY_TYPE_SPEAK,
-    PLAY_TYPE_SLEEP,
-};
+// 播放/情绪状态由 aitalk_core 统一维护 (GUI 无关核心, 全静态内存 2.1KB)
+#define PLAY_TYPE_SILENCE  AITALK_PLAY_SILENCE
+#define PLAY_TYPE_SPEAK    AITALK_PLAY_SPEAK
+#define PLAY_TYPE_SLEEP    AITALK_PLAY_SLEEP
+#define EMOTION_NEUTRAL    AITALK_EMOTION_NEUTRAL
+#define EMOTION_HAPPY      AITALK_EMOTION_HAPPY
+#define EMOTION_ANGRY      AITALK_EMOTION_ANGRY
+#define EMOTION_SAD        AITALK_EMOTION_SAD
+#define EMOTION_DOUBT      AITALK_EMOTION_DOUBT
 
-// 情绪枚举
-enum {
-    EMOTION_NEUTRAL = 0,
-    EMOTION_HAPPY,
-    EMOTION_ANGRY,
-    EMOTION_SAD,
-    EMOTION_DOUBT,
-};
-
-int play_type = PLAY_TYPE_SILENCE;
-
-typedef struct _Chat_Msg {
-    int uid;
-    char msg_buf[MAX_CHAT_MSG_LEN];
-} Chat_Msg;
-
-#define MAX_MSG_NUM 4
-typedef struct {
-    Chat_Msg messages[MAX_MSG_NUM];
-    int head;
-    int tail;
-    int count;
-} MsgQueue;
-
-static MsgQueue s_msg_queue = {0};
+int play_type = AITALK_PLAY_SILENCE;
 
 // SDK integration via convai_bridge
 #include "convai_bridge.h"
@@ -103,6 +81,7 @@ static int sdk_started = 0;
 
 static void sdk_status_callback(convai_status_e status) {
     sdk_status = status;
+    aitalk_on_sdk_status(status);
     printf("[AItalk] SDK status: %d\n", (int)status);
 }
 
@@ -111,21 +90,15 @@ static void stop_animation(void);
 static void update_status(void);
 
 static void add_msg(BroadcastMessage* msg) {
-    int msg_len = msg->msg_len;
-    int userid = msg->ext[0];
-    if (msg_len > (MAX_CHAT_MSG_LEN - 1)) {
-        msg_len = MAX_CHAT_MSG_LEN - 1;
-    }
+    aitalk_push_chat_msg(msg->ext[0], (const char*)msg->msg, msg->msg_len);
+}
 
-    goldie_mutex_lock(&msgque_mutex);
-    if (s_msg_queue.count < MAX_MSG_NUM) {
-        s_msg_queue.messages[s_msg_queue.tail].uid = userid;
-        memset(s_msg_queue.messages[s_msg_queue.tail].msg_buf, 0, MAX_CHAT_MSG_LEN);
-        memcpy(s_msg_queue.messages[s_msg_queue.tail].msg_buf, msg->msg, msg_len);
-        s_msg_queue.tail = (s_msg_queue.tail + 1) % MAX_MSG_NUM;
-        s_msg_queue.count++;
+// 云端 function_call (情绪等) 下发
+static void cloud_message_callback(const char *message) {
+    char call_id[40];
+    if (aitalk_on_sdk_message(message, strlen(message), call_id, sizeof(call_id))) {
+        current_emotion = aitalk_get_emotion();
     }
-    goldie_mutex_unlock(&msgque_mutex);
 }
 // 模拟眼睛状态变化
 static void update_avatar_ui(int play_type) {
@@ -309,17 +282,11 @@ static int play_task(void *param) {
     while (init_flag) {
         while (running_flag) {
             update_status();
-            
-            // Update state from SDK status
-            if (!sdk_started || sdk_status == CONVAI_STATUS_IDLE) {
-                play_type = PLAY_TYPE_SLEEP;
-            } else {
-                if (sdk_status == CONVAI_STATUS_ANSWERING) {
-                    play_type = PLAY_TYPE_SPEAK;
-                } else {
-                    play_type = PLAY_TYPE_SILENCE;
-                }
-            }
+
+            // 播放/情绪状态与动画计数由 aitalk_core 驱动
+            play_type = aitalk_get_play_type();
+            current_emotion = aitalk_get_emotion();
+            aitalk_tick();
 
             // 更新头像UI（眼睛/嘴巴）
             update_avatar_ui(play_type);
@@ -356,7 +323,6 @@ static void update_status() {
     if (sdk_engine) {
         avatar_id = 0;  // default avatar (no cloud config yet)
         sdk_status = convai_bridge_get_status();
-        current_emotion = EMOTION_NEUTRAL;
     }
 }
 
@@ -373,14 +339,19 @@ static void goldie_app_run(void) {
         mevtservice->register_broadcast_recv(EVENT_BROADCAST_ADDMSG, add_msg);
     }
 
+    /* AItalk core (GUI-agnostic state: play type, emotion, chat queue) */
+    aitalk_init();
+
     /* Get SDK engine via convai_bridge */
     sdk_engine = convai_bridge_get_engine();
     convai_bridge_on_status(sdk_status_callback);
+    convai_bridge_on_message(cloud_message_callback);
     printf("[AItalk] SDK engine: %p\n", (void*)sdk_engine);
 
     /* Start AI conversation session */
     convai_bridge_start();
     sdk_started = 1;
+    aitalk_set_sdk_started(1);
 
     update_status();
 
@@ -420,6 +391,9 @@ static void goldie_app_exit(void) {
     printf("[AItalk] stopping SDK engine\n");
     convai_bridge_stop();
     sdk_started = 0;
+    aitalk_set_sdk_started(0);
+    convai_bridge_on_message(NULL);
+    aitalk_deinit();
 
     // 清理线程
     if (play_thread) {

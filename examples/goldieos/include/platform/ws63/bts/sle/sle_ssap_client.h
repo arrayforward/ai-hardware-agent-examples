@@ -15,7 +15,7 @@
  
 #include <stdint.h>
 #include <stdbool.h>
-#include "platform\ws63\errcode.h"
+#include "platform/ws63/errcode.h"
 #include "sle_common.h"
 #include "sle_ssap_stru.h"
  

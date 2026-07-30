@@ -19,8 +19,12 @@ cmake_minimum_required(VERSION 3.10)
 # ---- Header search paths ----
 
 set(WS63_INCLUDE_DIRS
-    # SDK public headers
+    # SDK public headers (convai/convai_api.h 等, 仓库根 include)
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+
+    # Open ConvAI SDK (replaces closed libconvai_sdk.a) + AItalk core
+    ${CMAKE_CURRENT_SOURCE_DIR}/aitalk/include
 
     # SDK integration (replaces cloud_service)
     ${CMAKE_CURRENT_SOURCE_DIR}/sdk_integration
@@ -85,10 +89,8 @@ file(GLOB WS63_PLATFORM_SRC
     platform/ws63/sle/*.c
     platform/ws63/stubs.c
 )
-# ConvAI platform implementation
-list(APPEND WS63_PLATFORM_SRC
-    platform/convai_platform_ws63.c
-)
+# ConvAI platform layer removed: the open SDK (aitalk/src/convai_open.c)
+# uses goldie_osal directly and needs no platform abstraction.
 
 # Driver sources
 set(WS63_DRIVER_SRC
@@ -113,8 +115,12 @@ file(GLOB WS63_SERVICE_SRC
 )
 
 # SDK integration (replaces cloud_service)
+# + open ConvAI SDK engine/protocol/codecs/AItalk core (aitalk/src) —
+# open-source replacement for the closed libconvai_sdk.a, <100KB RAM
+# (see aitalk/include/convai_limits.h for the enforced budget).
 file(GLOB WS63_SDK_INTEGRATION_SRC
     sdk_integration/*.c
+    aitalk/src/*.c
 )
 
 # App sources — WS63 embedded apps
@@ -124,7 +130,7 @@ file(GLOB WS63_APP_SRC
     # apps/alarm/*.cpp
     apps/animaton_player/*.cpp
     # apps/recorder/*.cpp
-    # apps/AItalk/*.cpp
+    apps/AItalk/*.cpp
     # apps/Walkie-talkie/*.cpp
     # apps/Story/*.cpp
     # apps/Story/*.c
@@ -168,6 +174,10 @@ file(GLOB WS63_THIRDPARTY_SRC
 set(OPUS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/opus-1.6.1)
 if(EXISTS ${OPUS_DIR}/CMakeLists.txt)
     add_compile_definitions(CUSTOM_MODES)
+    # must match the firmware ABI (opus builds its own sub-project; the
+    # global add_compile_options below comes too late for it)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv32imfc -mabi=ilp32f")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv32imfc -mabi=ilp32f")
     set(OPUS_VAR_ARRAYS OFF CACHE BOOL "Disable variable length arrays" FORCE)
     set(OPUS_USE_ALLOCA OFF CACHE BOOL "Disable alloca" FORCE)
 
@@ -239,12 +249,6 @@ add_link_options(
     -nostdlib
 )
 
-# ---- Precompiled SDK library ----
-add_library(convai_sdk STATIC IMPORTED)
-set_target_properties(convai_sdk PROPERTIES
-    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/libs/ws63/libconvai_sdk.a
-)
-
 # ---- Library target ----
 add_library(goldieos_ws63 STATIC
     ${WS63_INIT_SRC}
@@ -259,11 +263,11 @@ add_library(goldieos_ws63 STATIC
 target_include_directories(goldieos_ws63 PRIVATE
     ${WS63_INCLUDE_DIRS}
     ${WS63_APP_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/aitalk/include
 )
 
 target_link_libraries(goldieos_ws63 PRIVATE
     opus
-    convai_sdk
     -lc  # Link musl C library for printf/vprintf
 )
 
@@ -292,15 +296,16 @@ set(OUTPUT_BIN "${OUTPUT_DIR}/goldieos.bin")
 set(OUTPUT_ELF "${OUTPUT_DIR}/goldieos.elf")
 
 # Library paths (relative, for ws63_link_v4.exe)
+# The open ConvAI SDK is compiled into libgoldieos_ws63.a — no precompiled
+# libconvai_sdk.a is linked anymore.
 set(WS63_LIB_GOLDIEOS "libgoldieos_ws63.a")
 set(WS63_LIB_OPUS "opus_build/libopus.a")
-set(WS63_LIB_SDK "${CMAKE_SOURCE_DIR}/libs/ws63/libconvai_sdk.a")
 
 add_custom_command(
     OUTPUT ${OUTPUT_BIN} ${OUTPUT_ELF}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${OUTPUT_DIR}
-    COMMAND ${WS63_LINKER} ${WS63_LINK_ROOT} "${WS63_LIB_GOLDIEOS},${WS63_LIB_OPUS},${WS63_LIB_SDK}" ${OUTPUT_DIR}
-    DEPENDS goldieos_ws63 opus convai_sdk
+    COMMAND ${WS63_LINKER} ${WS63_LINK_ROOT} "${WS63_LIB_GOLDIEOS},${WS63_LIB_OPUS}" ${OUTPUT_DIR}
+    DEPENDS goldieos_ws63 opus
     COMMENT "Generating firmware with ws63_link_v4"
     VERBATIM
 )

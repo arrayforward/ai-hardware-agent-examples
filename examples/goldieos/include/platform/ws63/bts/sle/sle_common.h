@@ -14,7 +14,7 @@
 #define SLE_COMMON_H
 
 #include <stdint.h>
-#include "platform\ws63\errcode.h"
+#include "platform/ws63/errcode.h"
 
 #ifdef __cplusplus
 extern "C" {
