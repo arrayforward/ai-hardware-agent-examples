@@ -113,7 +113,11 @@ typedef void* convai_engine_t;
 /* ---- Data Types ---- */
 
 typedef enum {
-    CONVAI_AUDIO_DATA_TYPE_G711A   = 0,
+    CONVAI_AUDIO_DATA_TYPE_G711A     = 0,
+    CONVAI_AUDIO_DATA_TYPE_PCM16     = 1,
+    CONVAI_AUDIO_DATA_TYPE_G711U     = 2,
+    CONVAI_AUDIO_DATA_TYPE_IMA_ADPCM = 3,
+    CONVAI_AUDIO_DATA_TYPE_OPUS      = 4,
 } convai_audio_data_type_e;
 
 typedef enum {

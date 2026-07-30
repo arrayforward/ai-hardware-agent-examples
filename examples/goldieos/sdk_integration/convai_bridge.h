@@ -90,6 +90,13 @@ void convai_bridge_on_message(convai_bridge_message_cb cb);
 void convai_bridge_set_startup_config(const char *config);
 const char *convai_bridge_get_startup_config(void);
 
+/**
+ * Print the open-engine memory/watermark report (static pools, TX/RX
+ * high-water marks and drop counters) — see convai_open_mem_report().
+ * Use it to tune convai_limits.h after on-board runs.
+ */
+void convai_bridge_mem_report(void);
+
 #ifdef __cplusplus
 }
 #endif

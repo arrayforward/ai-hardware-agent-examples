@@ -3,16 +3,23 @@
  * @brief Connects goldieos apps to the ConvAI SDK public API.
  *
  * Manages engine lifecycle, session state, and background audio recording.
- * Transport/protocol are stubs; key API calls are logged to stdout.
+ *
+ * Memory-optimised for WS63 (see aitalk/include/convai_limits.h, single
+ * source of truth for the <100KB budget):
+ *  - no per-frame malloc: record/playback buffers are file-static
+ *  - codec encode/decode lives inside the open engine (convai_open.c);
+ *    the bridge only moves PCM16 between the audio service and the SDK
+ *  - playback ring is a static 8KB arena with a 3-state consumer
+ *    (PRIMING/PLAYING/IDLE), drop-on-overflow for real-time TTS
  */
 #include "convai_bridge.h"
 #include "convai_config.h"
 #include "service_manager.h"
 #include "goldie_osal.h"
 #include "audio_service.h"
-#include "convai_codec_g711a.h"
 #include "ringbuffer.h"
-#include "../platform/convai_platform_ws63.h"
+#include "convai_limits.h"
+#include "convai_open.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -27,10 +34,7 @@ static convai_bridge_event_cb   g_event_cb   = NULL;
 static convai_bridge_message_cb g_message_cb = NULL;
 
 /* ---- startup config (set by settings UI, consumed by start) ---- */
-#define STARTUP_CONFIG_MAX  2048
-static char g_startup_config[STARTUP_CONFIG_MAX] = {0};
-
-#define INFO_CONFIG_MAX  2048
+static char g_startup_config[CONVAI_STARTUP_CONFIG_BYTES] = {0};
 
 /* ---- audio recording state ---- */
 typedef struct {
@@ -44,6 +48,10 @@ typedef struct {
 
 static audio_source_t g_audio_src = {0};
 
+/* ---- record thread static buffers (no per-frame malloc) ---- */
+static uint8_t g_rec_buf[CONVAI_RECORD_BUF_BYTES];     /* stereo interleaved capture */
+static uint8_t g_rec_mono[CONVAI_RECORD_BUF_BYTES / 2]; /* mono mic PCM16 */
+
 /* ---- audio dump for debugging (desktop only, no FS on embedded) ---- */
 #ifndef __EMBEDDED__
 static FILE *g_dump_file       = NULL;
@@ -52,15 +60,13 @@ static long   g_dump_data_bytes = 0;
 #endif
 
 /* ---- playback ring buffer (producer-consumer bridge) ---- */
-#define PLAYBACK_RING_SIZE      8000   /* 500ms @ 8kHz mono 16bit */
-#define PLAYBACK_PRIME_THRESHOLD  480   /* 160ms — enough to cover initial network jitter */
-static uint8_t      g_ring_data[PLAYBACK_RING_SIZE];
+#define PLAYBACK_PRIME_THRESHOLD  CONVAI_PLAYBACK_PRIME_BYTES
+static uint8_t      g_ring_data[CONVAI_PLAYBACK_RING_BYTES];
 static RingBuffer   g_playback_ring;
 
 /* ---- playback thread state ---- */
-
-static uint8_t g_pcm_decode_buf[1024];  /* 用于 on_audio 回调 */
-static char g_json_copy_buf[2048];       /* 用于 on_message_data 回调 */
+static char g_json_copy_buf[CONVAI_JSON_COPY_BYTES];  /* on_message_data 回调 */
+static uint8_t g_play_buf[CONVAI_PLAYBACK_BUF_BYTES]; /* playback drain chunk */
 
 enum {
     PLAYBACK_IDLE,      /* HW stopped, waiting for next response */
@@ -71,9 +77,6 @@ static int g_playback_state = PLAYBACK_IDLE;
 
 static int      g_playback_running = 0;   /* thread exit flag */
 static void    *g_playback_thread  = NULL;
-
-#define AUDIO_RECORD_BUF_SIZE  640   /* 40ms @ 8kHz mono 16bit = 640 bytes (double-buffered) */
-#define AUDIO_FRAME_MS          20
 
 #ifndef __EMBEDDED__
 /* Write a placeholder WAV header; sizes will be patched on stop. */
@@ -141,72 +144,44 @@ static int audio_record_thread(void *arg)
         return -1;
     }
 
-    uint8_t *buf = (uint8_t *)goldie_malloc(AUDIO_RECORD_BUF_SIZE);
-    uint8_t *planar_buf = (uint8_t *)goldie_malloc(AUDIO_RECORD_BUF_SIZE);
-    uint8_t *g711_buf = (uint8_t *)goldie_malloc(AUDIO_RECORD_BUF_SIZE);
-    if (!buf || !planar_buf || !g711_buf) {
-        printf("[convai_bridge] ERROR: buffer malloc failed\n");
-        goldie_free(buf);
-        goldie_free(planar_buf);
-        goldie_free(g711_buf);
-        return -1;
-    }
-
     /* Start audio capture */
     if (audio->record_start) audio->record_start();
     printf("[convai_bridge] audio recording started (sr=%d)\n", s->sample_rate);
 
     while (s->running) {
-        int len = audio->audio_read(buf, AUDIO_RECORD_BUF_SIZE);
+        int len = audio->audio_read(g_rec_buf, CONVAI_RECORD_BUF_BYTES);
         if (len > 0) {
             /*
              * GoldieOS audio hardware provides stereo interleaved PCM (L/R).
-             * We need planar format [L0, L1, ...] [R0, R1, ...] for cloud AEC.
-             * Both channels are silent frames.
+             * The left channel is the mic; extract it as mono PCM16 and
+             * hand it to the engine, which slices 20ms frames and encodes
+             * with the negotiated codec (G.711A by default).
              */
             int sample_count = len / (int)sizeof(short);   /* total 16-bit samples */
-            int frame_count = sample_count / 2;            /* stereo frames (L/R pairs) */
-            int16_t *samples = (int16_t *)buf;
-
-            /* Rearrange to planar format: [L0, L1, ... R0, R1, ...] */
-            int16_t *planar_samples = (int16_t *)planar_buf;
+            int frame_count  = sample_count / 2;           /* stereo frames (L/R pairs) */
+            const int16_t *samples = (const int16_t *)g_rec_buf;
+            int16_t *mono = (int16_t *)g_rec_mono;
             for (int i = 0; i < frame_count; i++) {
-                /* Left channel = mic data */
-                planar_samples[i] = samples[i * 2];
-                /* Right channel = silent (zero) for cloud AEC */
-                planar_samples[frame_count + i] = samples[i * 2 + 1];
+                mono[i] = samples[i * 2];                  /* left = mic */
             }
+            size_t mono_len = (size_t)frame_count * sizeof(int16_t);
 
-            /* Write mono PCM to debug dump file (desktop only) */
 #ifndef __EMBEDDED__
             if (g_dump_file) {
-                fwrite(planar_buf, 1, (size_t)len, g_dump_file);
-                g_dump_data_bytes += (size_t)len;
+                fwrite(g_rec_mono, 1, mono_len, g_dump_file);
+                g_dump_data_bytes += (long)mono_len;
             }
 #endif
 
-            /* Encode planar stereo PCM → G.711A before sending to SDK */
-            size_t  g711_len = 0;
-            int enc_ret = convai_g711a_encode(planar_buf, (size_t)len, 2,
-                                              g711_buf, AUDIO_RECORD_BUF_SIZE,
-                                              &g711_len);
-            if (enc_ret != 0 || g711_len == 0) {
-                printf("[convai_bridge] WARNING: g711 encode failed\n");
-            } else {
-                convai_audio_frame_info_t info;
-                memset(&info, 0, sizeof(info));
-                info.data_type = CONVAI_AUDIO_DATA_TYPE_G711A;
-
-                convai_bridge_send_audio(g711_buf, g711_len, &info);
-            }
+            convai_audio_frame_info_t info;
+            memset(&info, 0, sizeof(info));
+            info.data_type = CONVAI_AUDIO_DATA_TYPE_PCM16;
+            convai_bridge_send_audio(g_rec_mono, mono_len, &info);
         } else {
             goldie_msleep(10);
         }
     }
 
-    goldie_free(buf);
-    goldie_free(planar_buf);
-    goldie_free(g711_buf);
     printf("[convai_bridge] audio recording thread stopped\n");
     return 0;
 }
@@ -236,9 +211,6 @@ static int playback_thread_func(void *arg)
 
     printf("[convai_bridge] playback thread started (sr=%d)\n", sr);
 
-    uint8_t *buf = (uint8_t *)goldie_malloc(1024);
-    int len = 0;
-    
     int prev_state = PLAYBACK_IDLE;
     while (g_playback_running) {
 
@@ -252,8 +224,9 @@ static int playback_thread_func(void *arg)
                 if (prev_state != PLAYBACK_IDLE) {
                     int d;
                     while ((d = ring_buffer_bulk_read_noblock(&g_playback_ring,
-                                                            buf, 1024)) > 0) {
-                        playback_write(audio, buf, (unsigned int)d);
+                                                            g_play_buf,
+                                                            CONVAI_PLAYBACK_BUF_BYTES)) > 0) {
+                        playback_write(audio, g_play_buf, (unsigned int)d);
                     }
                     /* play_stop is idempotent — safe to call even if already stopped */
                     if (audio && audio->play_stop) {
@@ -286,8 +259,9 @@ static int playback_thread_func(void *arg)
             case PLAYBACK_PLAYING: {
                 int d;
                 while ((d = ring_buffer_bulk_read_noblock(&g_playback_ring,
-                                                        buf, 1024)) > 0) {
-                    playback_write(audio, buf, (unsigned int)d);
+                                                        g_play_buf,
+                                                        CONVAI_PLAYBACK_BUF_BYTES)) > 0) {
+                    playback_write(audio, g_play_buf, (unsigned int)d);
                 }
                 goldie_msleep(10);
                 break;
@@ -300,20 +274,20 @@ static int playback_thread_func(void *arg)
     /* ---- Thread exiting ---- */
     g_playback_state = PLAYBACK_IDLE;
 
-    /* Drain remaining, stop HW, finalize dump files */
+    /* Drain remaining, stop HW */
     {
         int d;
         while ((d = ring_buffer_bulk_read_noblock(&g_playback_ring,
-                                                   buf, 1024)) > 0) {
-            playback_write(audio, buf, (unsigned int)d);
+                                                   g_play_buf,
+                                                   CONVAI_PLAYBACK_BUF_BYTES)) > 0) {
+            playback_write(audio, g_play_buf, (unsigned int)d);
         }
     }
 
     if (audio && audio->play_stop) {
         audio->play_stop();
     }
-    
-    goldie_free(buf);
+
     printf("[convai_bridge] playback thread stopped\n");
     return 0;
 }
@@ -325,13 +299,13 @@ static void start_playback_thread(void)
     /* Init the ring buffer (mutex is initialised by ring_buffer_init) */
     ring_buffer_init(&g_playback_ring);
     g_playback_ring.buffer     = g_ring_data;
-    g_playback_ring.buffer_len = PLAYBACK_RING_SIZE;
+    g_playback_ring.buffer_len = CONVAI_PLAYBACK_RING_BYTES;
 
     g_playback_running = 1;
     g_playback_state = PLAYBACK_IDLE;
 
     g_playback_thread = goldie_thread_create(
-        playback_thread_func, NULL, "convai_playback", 0x2000);
+        playback_thread_func, NULL, "convai_playback", CONVAI_PLAYBACK_TASK_STACK);
     if (g_playback_thread) {
         goldie_thread_set_priority(g_playback_thread, 21);
     }
@@ -369,7 +343,7 @@ static void start_audio_recording(void)
     if (g_dump_file) {
         dump_wav_header(g_dump_file,
                         g_audio_src.sample_rate ? g_audio_src.sample_rate : 8000,
-                        g_audio_src.channels ? g_audio_src.channels : 1,
+                        1,
                         g_audio_src.bits_per_sample ? g_audio_src.bits_per_sample : 16);
         g_dump_data_bytes = 0;
         printf("[convai_bridge] audio dump file opened: %s\n", AUDIO_DUMP_PATH);
@@ -380,7 +354,7 @@ static void start_audio_recording(void)
 
     g_audio_src.running = 1;
     g_audio_src.thread_handle = goldie_thread_create(
-        audio_record_thread, NULL, "convai_audio", 0x2000);
+        audio_record_thread, NULL, "convai_audio", CONVAI_RECORD_TASK_STACK);
     if (g_audio_src.thread_handle) {
         goldie_thread_set_priority(g_audio_src.thread_handle, 22);
     }
@@ -414,7 +388,7 @@ static void stop_audio_recording(void)
 #endif
 
     printf("[convai_bridge] audio recording stopped\n");
-    
+
     /* Stop the playback thread */
     stop_playback_thread();
 }
@@ -425,6 +399,7 @@ static void stop_audio_recording(void)
 #define BRIDGE_DEFAULT_PRODUCT_KEY    "your_product_key"    // ← 替换为实际的 product_key
 #define BRIDGE_DEFAULT_PRODUCT_SECRET "your_product_secret" // ← 替换为实际的 product_secret
 #define BRIDGE_DEFAULT_DEVICE_NAME    "your_device_name"    // ← 替换为实际的 device_name
+#define BRIDGE_DEFAULT_SERVER_URL     "ws://192.168.1.100:9000/"
 #define DEFAULT_STARTUP_CONFIG \
     "{" \
             "\"config\":{" \
@@ -467,16 +442,18 @@ static const char *bridge_build_config_json(char *buf, size_t buf_size)
                 "\"device_name\":\"%s\""
             "},"
             "\"ws\":{"
+                "\"url\":\"%s\","
                 "\"audio\":{"
                     "\"codec\":%d"
                 "}"
             "}"
-        "}", 
+        "}",
         cfg_or("product_id",      BRIDGE_DEFAULT_PRODUCT_ID),
         cfg_or("product_key",     BRIDGE_DEFAULT_PRODUCT_KEY),
         cfg_or("product_secret",  BRIDGE_DEFAULT_PRODUCT_SECRET),
         cfg_or("device_name",     BRIDGE_DEFAULT_DEVICE_NAME),
-        0
+        cfg_or("server_url",      BRIDGE_DEFAULT_SERVER_URL),
+        1   /* codec: 1 = G.711A (convai_codec_id_e) */
     );
     (void)n; /* truncation is acceptable — engine will reject malformed JSON */
     return buf;
@@ -546,25 +523,15 @@ static void on_audio(convai_engine_t e, const void *data, size_t len,
 {
     (void)e; (void)ud; (void)info;
 
-    size_t  pcm_len = 0;
-    int dec_ret = convai_g711a_decode((const uint8_t *)data, len,
-                                      g_pcm_decode_buf, sizeof(g_pcm_decode_buf), &pcm_len);
-    if (dec_ret != 0 || pcm_len == 0) {
-        printf("[convai_bridge] WARNING: g711 decode failed (ret=%d pcm_len=%zu)\n",
-               dec_ret, pcm_len);
-        return;
-    }
-
     /*
-     * Push decoded PCM into the ring buffer (non-blocking).
-     * If the buffer is full, data is dropped — this is acceptable for
-     * real-time TTS; the playback thread will catch up.
+     * The open engine delivers already-decoded mono PCM16
+     * (CONVAI_AUDIO_DATA_TYPE_PCM16) — push straight into the playback
+     * ring (non-blocking). If the ring is full, data is dropped, which
+     * is acceptable for real-time TTS; the playback thread catches up.
      */
-    printf("pcm input-----------------------------write=%d, count=%u bytes\r\n",
-        pcm_len, (unsigned int)g_playback_ring.count);
     int written = ring_buffer_bulk_write_noblock(&g_playback_ring,
-                                                  g_pcm_decode_buf,
-                                                  (unsigned int)pcm_len);
+                                                  (const uint8_t *)data,
+                                                  (unsigned int)len);
     (void)written;
 }
 
@@ -595,21 +562,20 @@ void convai_bridge_init(void)
         printf("[convai_bridge] already initialized\n");
         return;
     }
-    
+
     // FIXME: WS63 platform——open file
     /* Initialise config from file alongside the executable */
     // if (convai_config_init() != 0) {
     //     printf("[convai_bridge] WARNING: no config file, using defaults\n");
     // }
 
-    char config_json[2048];
+    char config_json[1024];
     const char *cfg = bridge_build_config_json(config_json, sizeof(config_json));
 
     printf("[convai_bridge] using config:\n%s\n", cfg);
 
-    /* Initialize platform abstraction layer */
-    int retPlat = convai_platform_ws63_init();
-    printf("[convai_bridge] convai_platform_ws63_init ret: %d", retPlat);
+    /* The open engine (convai_open.c) uses goldie_osal directly;
+     * no platform abstraction layer is required. */
 
     convai_event_handler_t cb;
     memset(&cb, 0, sizeof(cb));
@@ -735,6 +701,12 @@ int convai_bridge_send_audio(const uint8_t *data, size_t len,
 {
     if (!g_engine || !g_started) return -1;
     return convai_send_audio(g_engine, data, len, info);
+}
+
+/** Print the open-engine memory/watermark report (observability, 路线5). */
+void convai_bridge_mem_report(void)
+{
+    convai_open_mem_report();
 }
 
 void convai_bridge_on_status(convai_bridge_status_cb cb)   { g_status_cb  = cb; }
