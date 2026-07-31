@@ -4,11 +4,14 @@
 > **「修改思路 → 修改方案 → 修改效果」** 三段讲清楚，严格按顺序执行，
 > 每步验收通过再进下一步。
 >
-> **目标**（两个，同时达成）：
-> 1. WS63 goldieos 工程的 AItalk 应用，其**协议栈 + SDK 部分内存 < 100KB**
->    （102400 字节），且网络/系统卡顿时丢帧不崩溃。
+> **目标**（三个，同时达成）：
+> 1. **整个 SDK 层**（开源引擎 + convai.v1 协议栈 + WS/TLS 传输 + bridge
+>    集成层）**内存 < 100KB**（102400 字节；**不含 AItalk 应用本体**），
+>    且网络/系统卡顿时丢帧不崩溃。
 > 2. 用开源自研实现**替换闭源 `libconvai_sdk.a`**（不是移植别的系统，
 >    是在原 goldieos 工程内重写优化）。
+> 3. 支持 **WSS（WebSocket Secure）**：TLS 1.2 + AES-256-GCM + ECDSA P-256
+>    证书验签，非明文。
 >
 > **参考经验**：`examples/goldieos/05-memory-optimization-100kb.md`。
 > **完成态参考实现**：`examples/goldieos/aitalk/`（本指南描述的代码均已存在，
@@ -62,24 +65,31 @@ aitalk/src/convai_ws_client.c     RFC6455 最小 WS 客户端(mbedtls_net 明文
 
 **修改思路**：优化前各缓冲/栈大小散落在十几个文件里，没人说得清总量。
 先把所有尺寸集中到一处并配编译期断言，后面的每一步都从这里取常量——
-这是整个优化的"地基"，必须第一个做。
+这是整个优化的"地基"，必须第一个做。**预算口径 = 整个 SDK 层**
+（引擎+协议栈+WS/TLS+bridge），AItalk 应用本体不计入。
 
-**修改方案**：新建文件，四段内容：
+**修改方案**：新建文件，五段内容：
 1. SDK 引擎：`CONVAI_TX_FRAMES 8`、`CONVAI_TX_SLOT 768`、
    `CONVAI_RX_RING_BYTES 8192`、`CONVAI_ENC_BUF_BYTES 1024`、
    `CONVAI_DEC_PCM_SAMPLES 2048`、任务栈 8192/4096/4096、WS 缓冲 4096/1536。
-2. bridge：播放环 8000、预充阈值 480、录音块 640、播放块 1024、
+2. TLS/WSS：`CONVAI_TLS_IN_CONTENT_LEN 4096`、`CONVAI_TLS_OUT_CONTENT_LEN 4096`
+   （必须与 libmbedtls 编译配置一致）、`CONVAI_TLS_HANDSHAKE_BYTES 4096`
+   （X.509+ECDHE+DRBG 握手峰值）。
+3. bridge：播放环 8000、预充阈值 480、录音块 640(+mono 320)、播放块 1024、
    JSON 拷贝 2048、startup 配置 2048、录音/播放任务栈各 6144。
-3. 应用：消息 `4×512`、UI 线程栈 4096。
-4. 汇总宏 + 断言：
+4. 应用（信息列出，不计入预算）：消息 `4×512`、UI 线程栈 4096。
+5. 汇总宏 + 双断言（ws 与 wss 两种形态都不许超 100KB）：
 
 ```c
 #define CONVAI_BUDGET_LIMIT_BYTES  102400
-CONVAI_STATIC_ASSERT(CONVAI_BUDGET_TOTAL_BYTES <= CONVAI_BUDGET_LIMIT_BYTES,
-                     "convai sub-system memory budget exceeds 100KB");
+CONVAI_STATIC_ASSERT(CONVAI_BUDGET_SDKLAYER_WS_BYTES  <= CONVAI_BUDGET_LIMIT_BYTES, ...);
+CONVAI_STATIC_ASSERT(CONVAI_BUDGET_SDKLAYER_WSS_BYTES <= CONVAI_BUDGET_LIMIT_BYTES, ...);
 ```
 
-**修改效果**：预算表固化进代码，当前合计 **81936B / 102400B（80%）**。
+**修改效果**：预算表固化进代码。**SDK 层合计：明文 ws 74768B；
+wss（+TLS 记录缓冲 8K + 握手峰值 4K）87056B / 102400B（85%）**。
+⚠️ 前提：libmbedtls 以 `MBEDTLS_SSL_IN/OUT_CONTENT_LEN=4096` 编译；
+若为 16KB 默认预编译库，WSS 增量从 12KB 涨到 ~37KB 会超预算，必须重编。
 验收：把任一常量调大 10 倍，编译立即报错（断言生效），测完调回。
 
 ### 3.2 新建 `aitalk/src/convai_protocol.c/.h` —— convai.v1 线协议
@@ -349,9 +359,108 @@ g711a/adpcm 等四种软编解码不受影响。
   →mem report→stop/destroy）。
 - `run_e2e.ps1`：一键构建网关+mock、编译设备模拟器、起服务、跑测试、清理。
 
-**修改效果**：`=== PASS (0 failures) ===`——hello→listening→thinking→
-文本回复→answering→62 帧/19840B PCM（两轮 TTS）→answer_finished；
-TX/RX 零丢帧。同时产出主机可复现的预算打印（81936B）。
+**修改效果**：`=== PASS (0 failures) ===`。同时产出主机可复现的预算打印
+（SDK 层 ws 74768B / wss 87056B）。
+
+### 3.16 新建 `aitalk/certs/` + `aitalk/src/convai_root_ca.c` —— 内嵌根 CA
+
+**修改思路**：WSS 验签需要设备预置网关的根 CA。闭源 SDK 的 TLSAL 是 stub
+（只能明文），开源实现必须补齐生产可用的证书链路。证书选型 ECDSA P-256
+而非 RSA-2048：RISC-V/Xtensa 无大数指令，ECDSA 握手快约 10 倍、RAM 更小。
+
+**修改方案**：
+1. 生成自签证书（openssl，等价网关仓库 `scripts/gen_cert.sh`）：
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -days 3650 -keyout server.key -out server_ca.pem -subj "/CN=router.local" \
+  -addext "subjectAltName=DNS:router.local,DNS:localhost,IP:127.0.0.1" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,digitalSignature"
+```
+
+   ⚠️ **必须带 `basicConstraints=critical,CA:TRUE`**，否则 mbedTLS 验链
+   报 `BADCERT_NOT_TRUSTED`（已踩坑）。`server.key` 给网关，`server_ca.pem`
+   给设备；仓库里这份是**测试专用**，生产私钥绝不入库。
+2. `convai_root_ca.c` 把 PEM 原样嵌成 `const char g_convai_root_ca_pem[]`
+   字符串（生产替换此文件内容即可）。
+
+**修改效果**：设备侧验签零文件系统依赖；E2E 中 CA 验签实测通过
+（verify=0x0）。
+
+### 3.17 修改 `aitalk/src/convai_ws_client.c/.h` —— TLS（WSS）传输层
+
+**修改思路**：在最小 WS 客户端上加 mbedTLS 层，把「明文 TCP」与「TLS」
+收敛成同一套 IO 接口，引擎无感知。安全参数按 MCU 特性选定（对应 05 文档
+路线 4）。
+
+**修改方案**：
+1. 新增 `convai_wsc_tls_t { ca_pem, skip_cn_check, ciphersuites }` 与
+   `convai_wsc_connect_ex()`；旧 `convai_wsc_connect()` 变透明文包装
+   （`tls=NULL`），已有调用零改动。
+2. 连接顺序：TCP connect → `tls_handshake()` → WS 握手。握手内含
+   entropy+CTR-DRBG 初始化、X.509 CA 解析、`VERIFY_REQUIRED`（ca_pem
+   为 NULL 才退化为 `VERIFY_NONE` 调试用）、`set_hostname`（skip_cn_check
+   时跳过，用于 IP 直连——mbedtls 对 IP SAN 字面匹配受限）。
+3. **套件白名单**（与网关 runTLS 完全一致）：TLS 1.2 only，
+   `ECDHE-ECDSA/RSA + AES-256/128-GCM`，AES-256-GCM 优先；
+   另提供 `g_convai_wsc_suites_aes256[]`（仅 256 两组）供强制 AES-256。
+4. IO 分流：`low_send/low_recv` 按 `tls_active` 在 `mbedtls_net_*` 与
+   `mbedtls_ssl_write/read` 间切换；`WANT_READ` 映射为"would block"进入
+   原有的超时等待循环（poll 超时语义不变）。
+5. `convai_wsc_get_ciphersuite()` 暴露协商套件名（生产可观测 + 测试断言）。
+6. 可用 `CONVAI_WSC_NO_TLS` 编译宏裁掉 TLS（纯明文场景省内存/体积）。
+7. 握手/验签失败打印 mbedTLS 错误码（`-0x2700` + verify flags），
+   否则上板根本没法定位 TLS 问题。
+
+**修改效果**：TLS 增量内存定界 **+12KB**（in/out 4K×2 + 握手峰值 4K，
+见 3.1 前提）；E2E 实测协商出
+`TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384` 并完成完整对话轮。
+
+### 3.18 修改 `aitalk/src/convai_open.c` —— 引擎 wss:// 接线
+
+**修改思路**：让应用/bridge 对 TLS 完全无感——只改服务器 URL
+（`ws://` → `wss://`），其余照旧。
+
+**修改方案**：
+1. `parse_ws_url` 识别 `wss://`（默认端口 443，输出 `use_tls`）。
+2. 配置 JSON 新增 `"ws":{"tls":{"skip_cn_check":bool,"aes256_only":bool}}`
+   （均可选）：`skip_cn_check` 用于 IP 直连；`aes256_only` 把套件收窄到
+   `g_convai_wsc_suites_aes256`（**Go 网关内置偏好 AES-128-GCM，
+   不收窄的话即使设备把 256 排第一也会协商成 128**——已实测）。
+3. `convai_start`：wss 时用内嵌 CA 调 `convai_wsc_connect_ex`，
+   连接后 LOGI 打印协商套件与校验方式。
+4. 新增 `convai_open_get_ciphersuite()`（测试与运维断言用）。
+
+**修改效果**：bridge/settings/AItalk 零改动获得 WSS；三种形态
+（ws / wss 全量校验 / wss IP 直连 skip_cn / wss 强制 AES-256）E2E 全过。
+
+### 3.19 修改 `aitalk/e2e_host/` —— WSS E2E 场景
+
+**修改思路**：WSS 的正确性必须端到端证明（证书链、套件、音频通路），
+不能只编译通过。主机 E2E 链接仓库自带的 win10 预编译 mbedTLS
+（mbedtls 3.1.0，与 WS63 同源头文件）。
+
+**修改方案**：
+1. `run_e2e.ps1`：gcc 加 `-I include/third_party/mbedtls` +
+   `libs/win10/{libmbedtls,libmbedx509,libmbedcrypto}.a -lbcrypt`；
+   网关额外起 `router -listen :19001 -tls-cert server_ca.pem -tls-key server.key`；
+   脚本开头清理残留 router/mock 进程（防止旧证书孤儿进程占端口造成
+   灵异 NOT_TRUSTED——已踩坑）。
+2. `net_sockets_host.c`：socket 超时返回 `MBEDTLS_ERR_SSL_WANT_READ(-0x6900)`
+   （mbedtls 的 bio 约定，否则 TLS 读阻塞语义错误）。
+3. `vsnprintf_s_compat.c`：win10 预编译库（MSVC 构建）引用 `vsnprintf_s`，
+   MinGW 只有内联版本，补一个外部符号（注意不能在包含 `<stdio.h>` 的
+   编译单元里定义，会与其内联定义冲突）。
+4. `e2e_main.c` 四轮场景：
+   ① `ws://127.0.0.1:19000/` 明文基线；
+   ② `wss://localhost:19001/` **CA+CN 全量校验**（SAN 含 DNS:localhost）；
+   ③ `wss://127.0.0.1:19001/` + `skip_cn_check` IP 直连（CA 验签保留）；
+   ④ `wss://localhost:19001/` + `aes256_only` **断言协商结果为
+   AES-256-GCM-SHA384**，并完成完整对话轮。
+
+**修改效果**：四轮 `=== PASS (0 failures) ===`；每轮均完成
+hello→listening→thinking→text→answering→~40 帧 TTS→answer_finished。
 
 ## 4. E2E 运行与判据
 
@@ -360,10 +469,12 @@ powershell -File examples\goldieos\aitalk\e2e_host\run_e2e.ps1
 ```
 
 PASS 判据（全绿）：
-1. 自测：ring 回绕/整帧丢弃、g711a 0xD5 向量、信封/音频头编解码、预算断言；
-2. E2E：`hello→hello_ack→listening` → mock ASR 出句 → `thinking` →
+1. 自测：ring 回绕/整帧丢弃、g711a 0xD5 向量、信封/音频头编解码、
+   SDK 层 ws/wss 双预算断言；
+2. E2E 四轮（明文 ws / wss 全量校验 / wss IP 直连 / wss 强制 AES-256-GCM），
+   每轮：`hello→hello_ack→listening` → mock ASR 出句 → `thinking` →
    LLM 文本 → `answering` → 下行 ~40 帧/轮（0.8s TTS，20ms=320B/帧 PCM）→
-   `answer_finished`；
+   `answer_finished`；第④轮断言套件为 `AES-256-GCM-SHA384`；
 3. mem report 水位可解释。
 
 连不上时排查顺序：① `netstat -ano | findstr ":19000"` 确认是 router.exe
@@ -383,13 +494,22 @@ PASS 判据（全绿）：
 | PowerShell 改写源文件 | `illegal UTF-8` | 用 `[IO.File]::ReadAllBytes/WriteAllBytes` |
 | data_type 与 codec id 混用 | 已编码帧被二次编码 | §3.6 显式映射 |
 | libgcc 软浮点 | `_Unwind_*` 未定义 | §3.12 unwind_stub.c |
+| 自签证书缺 `CA:TRUE` | 握手 `-0x2700` verify=0x04/0x08 | §3.16 证书必须带 `basicConstraints=critical,CA:TRUE` |
+| Go 网关偏好 AES-128 | 设备 256 排第一仍协商成 128 | §3.18 `aes256_only` 收窄套件白名单 |
+| IP SAN 主机名不匹配 | CN_MISMATCH | §3.17 `skip_cn_check`（IP 直连形态） |
+| 残留 router 进程持旧证书 | 灵异 NOT_TRUSTED | 测试前 `Get-Process router,mockbackends \| Stop-Process` |
+| `vsnprintf_s` 未定义 | win10 库 MSVC 符号 MinGW 无 | §3.19 独立编译单元补符号 |
+| libmbedtls 16K 记录缓冲 | WSS 超预算 | §3.1 以 4096 重编 `SSL_IN/OUT_CONTENT_LEN` |
 
 ## 6. 最终验收 Checklist
 
-- [ ] `convai_limits.h` 断言生效，预算合计 ≤ 102400（当前 **81936B**）
-- [ ] 主机自测 + E2E `PASS (0 failures)`
+- [ ] `convai_limits.h` 双断言生效：SDK 层 ws ≤ 102400（**74768B**）、
+      wss ≤ 102400（**87056B**）
+- [ ] 主机自测 + E2E 四轮 `PASS (0 failures)`，第④轮套件 = AES-256-GCM
 - [ ] `convai_bridge.c` 内 `goldie_malloc` 只剩 `#ifndef __EMBEDDED__` 调试段
 - [ ] 全工程只剩一份 `convai_g711a_encode/decode`
 - [ ] CMake 不再引用 `libconvai_sdk.a` / `convai_platform_ws63.c`
+- [ ] WSS 三形态可用：全量校验（域名）/ IP 直连 skip_cn / aes256_only
+- [ ] libmbedtls 以 `MBEDTLS_SSL_IN/OUT_CONTENT_LEN=4096` 编译（wss 预算前提）
 - [ ] （有工具链时）固件 `goldieos.elf/bin` 链接成功
 - [ ] （上板后）跑一次 `convai_bridge_mem_report()`，按水位微调 limits

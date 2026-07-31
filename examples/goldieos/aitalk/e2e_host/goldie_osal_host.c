@@ -135,3 +135,5 @@ void goldie_sem_destroy(goldie_sem *s)
     free(h);
     s->sem = NULL;
 }
+
+/* ---- MSVC secure-lib shim: see vsnprintf_s_compat.c ---- */

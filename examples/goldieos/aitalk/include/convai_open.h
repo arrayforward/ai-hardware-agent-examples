@@ -38,6 +38,9 @@ int convai_open_set_codec(int codec_id);
 /** Current codec id, or -1 when engine not created. */
 int convai_open_get_codec(void);
 
+/** Negotiated TLS ciphersuite (WSS 会话), or NULL when plain ws / not started. */
+const char *convai_open_get_ciphersuite(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -69,7 +69,7 @@ int mbedtls_net_recv(void *ctx, unsigned char *buf, size_t len)
     if (ret == 0) return MBEDTLS_ERR_NET_CONN_RESET;
     if (ret == SOCKET_ERROR) {
         int e = WSAGetLastError();
-        if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) return -2;   /* would block */
+        if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_READ;
         if (e == WSAECONNRESET || e == WSAECONNABORTED) return MBEDTLS_ERR_NET_CONN_RESET;
         return -1;
     }

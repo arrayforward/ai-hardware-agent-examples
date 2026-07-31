@@ -118,15 +118,20 @@ static void test_protocol(void)
 
 static void test_budget(void)
 {
-    printf("-- memory budget (convai_limits.h) --\n");
-    printf("  SDK    %5d B\n", CONVAI_BUDGET_SDK_BYTES);
-    printf("  bridge %5d B\n", CONVAI_BUDGET_BRIDGE_BYTES);
-    printf("  app    %5d B\n", CONVAI_BUDGET_APP_BYTES);
-    printf("  json   %5d B\n", CONVAI_BUDGET_JSON_TRANSIENT);
-    printf("  TOTAL  %5d B / %d B\n", CONVAI_BUDGET_TOTAL_BYTES,
+    printf("-- memory budget (convai_limits.h, SDK 层口径, 不含应用本体) --\n");
+    printf("  engine+stack %5d B\n", CONVAI_BUDGET_SDK_BYTES);
+    printf("  bridge       %5d B\n", CONVAI_BUDGET_BRIDGE_BYTES);
+    printf("  json transient %4d B\n", CONVAI_BUDGET_JSON_TRANSIENT);
+    printf("  TLS (wss)    %5d B\n", CONVAI_BUDGET_TLS_BYTES);
+    printf("  SDK层 ws     %5d B / %d B\n", CONVAI_BUDGET_SDKLAYER_WS_BYTES,
            CONVAI_BUDGET_LIMIT_BYTES);
-    CHECK(CONVAI_BUDGET_TOTAL_BYTES <= CONVAI_BUDGET_LIMIT_BYTES,
-          "total budget under 100KB");
+    printf("  SDK层 wss    %5d B / %d B\n", CONVAI_BUDGET_SDKLAYER_WSS_BYTES,
+           CONVAI_BUDGET_LIMIT_BYTES);
+    printf("  (参考) app本体 %4d B (不计入预算)\n", CONVAI_BUDGET_APP_BYTES);
+    CHECK(CONVAI_BUDGET_SDKLAYER_WS_BYTES <= CONVAI_BUDGET_LIMIT_BYTES,
+          "SDK-layer ws budget under 100KB");
+    CHECK(CONVAI_BUDGET_SDKLAYER_WSS_BYTES <= CONVAI_BUDGET_LIMIT_BYTES,
+          "SDK-layer wss budget under 100KB");
 }
 
 /* ================= e2e vs real gateway ================= */
@@ -176,14 +181,27 @@ static void on_message(convai_engine_t e, const void *data, size_t len,
 
 #define STATUS_SEEN(st) ((g_status_mask & (1UL << (st))) != 0)
 
-static void test_e2e(void)
+/* One full conversation round against the gateway at @url.
+ * @expect_suite: 期望协商套件包含的子串 (如 "AES-256-GCM"), NULL=明文 ws。
+ * @skip_cn:      device-side tls.skip_cn_check (IP 直连场景)。
+ * @aes256_only:  device-side tls.aes256_only (强制 AES-256-GCM)。 */
+static void e2e_round(const char *url, const char *expect_suite,
+                      int skip_cn, int aes256_only)
 {
-    printf("-- e2e vs convai.v1 gateway --\n");
+    printf("-- e2e round: %s (skip_cn=%d aes256_only=%d) --\n",
+           url, skip_cn, aes256_only);
+    g_connected = 0;
+    g_status_mask = 0;
+    g_audio_frames = g_audio_bytes = 0;
+    g_text_msgs = 0;
 
-    const char *cfg =
+    char cfg[768];
+    snprintf(cfg, sizeof(cfg),
         "{\"info\":{\"product_id\":\"pid\",\"product_key\":\"pk\","
         "\"product_secret\":\"ps\",\"device_name\":\"e2e-host\"},"
-        "\"ws\":{\"url\":\"ws://127.0.0.1:19000/\",\"audio\":{\"codec\":1}}}";
+        "\"ws\":{\"url\":\"%s\",\"audio\":{\"codec\":1},"
+        "\"tls\":{\"skip_cn_check\":%s,\"aes256_only\":%s}}}",
+        url, skip_cn ? "true" : "false", aes256_only ? "true" : "false");
 
     convai_event_handler_t h;
     memset(&h, 0, sizeof(h));
@@ -200,9 +218,17 @@ static void test_e2e(void)
                          .params = "{\"config\":{}}" };
     CHECK(convai_start(eng, &opt) == CONVAI_OK, "convai_start");
 
+    if (expect_suite) {
+        const char *cs = convai_open_get_ciphersuite();
+        printf("[e2e] TLS ciphersuite: %s\n", cs ? cs : "(none)");
+        char msg[96];
+        snprintf(msg, sizeof(msg), "negotiated suite contains %s", expect_suite);
+        CHECK(cs && strstr(cs, expect_suite) != NULL, msg);
+    }
+
     /* wait for hello_ack -> CONNECTED + LISTENING */
     int waited = 0;
-    while (!g_connected && waited < 5000) { goldie_msleep(50); waited += 50; }
+    while (!g_connected && waited < 8000) { goldie_msleep(50); waited += 50; }
     CHECK(g_connected, "hello_ack -> CONNECTED (session established)");
     CHECK(STATUS_SEEN(CONVAI_STATUS_LISTENING), "status LISTENING");
 
@@ -239,6 +265,22 @@ static void test_e2e(void)
 
     CHECK(convai_stop(eng) == CONVAI_OK, "convai_stop");
     convai_destroy(eng);
+}
+
+static void test_e2e(void)
+{
+    printf("-- e2e vs convai.v1 gateway (ws 明文 + wss TLS) --\n");
+    /* 明文 ws 基线 */
+    e2e_round("ws://127.0.0.1:19000/", NULL, 0, 0);
+    /* WSS 全量校验: CA 验签 + CN/SAN 主机名校验 (SAN 含 DNS:localhost)。
+     * 注: Go 网关内置偏好 AES-128-GCM, 默认宽名单下协商为 128;
+     * AEAD (GCM) 是有保密+完整性的, 强制 256 见下轮。 */
+    e2e_round("wss://localhost:19001/", "GCM", 0, 0);
+    /* WSS IP 直连: CA 验签保留, 跳过 CN (mbedtls 对 IP SAN 字面匹配受限,
+     * 设备按 IP 直连的生产形态, 见 convai_limits.h TLS 节) */
+    e2e_round("wss://127.0.0.1:19001/", "GCM", 1, 0);
+    /* WSS 强制 AES-256-GCM (收窄 offers, 网关只能选 256) */
+    e2e_round("wss://localhost:19001/", "AES-256-GCM", 0, 1);
 }
 
 int main(void)

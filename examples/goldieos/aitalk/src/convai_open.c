@@ -49,6 +49,9 @@ typedef struct {
     char device_name[64];
     char agent_id[80];
     char *startup_params;
+    int  use_tls;            /* wss:// */
+    int  tls_skip_cn;        /* IP 直连跳过 CN/SAN 校验 */
+    int  tls_aes256_only;    /* 强制 AES-256-GCM (Go 网关默认偏好 128) */
 
     /* codec */
     const convai_codec_t *codec;
@@ -156,6 +159,11 @@ int convai_open_set_codec(int codec_id)
 int convai_open_get_codec(void)
 {
     return (g_eng && g_eng->codec) ? (int)g_eng->codec->id : -1;
+}
+
+const char *convai_open_get_ciphersuite(void)
+{
+    return (g_eng && g_eng->ws) ? convai_wsc_get_ciphersuite(g_eng->ws) : NULL;
 }
 
 /* ---------------- envelopes ---------------- */
@@ -344,14 +352,15 @@ static int recv_task(void *arg)
     return 0;
 }
 
-/* ---------------- URL parsing (ws://host[:port][/path]) ---------------- */
+/* ---------------- URL parsing (ws|wss://host[:port][/path]) ---------------- */
 
 static int parse_ws_url(const char *url, char *host, size_t host_cap,
-                        uint16_t *port, char *path, size_t path_cap)
+                        uint16_t *port, char *path, size_t path_cap, int *is_tls)
 {
     const char *p = url;
+    *is_tls = 0;
     if (!strncmp(p, "ws://", 5))       { p += 5; *port = 9000; }
-    else if (!strncmp(p, "wss://", 6)) { p += 6; *port = 443; }
+    else if (!strncmp(p, "wss://", 6)) { p += 6; *port = 443; *is_tls = 1; }
     else return -1;
 
     const char *slash = strchr(p, '/');
@@ -405,6 +414,17 @@ int convai_create(convai_engine_t *handle,
         const cJSON *audio = cJSON_GetObjectItemCaseSensitive(ws, "audio");
         if (audio && (item = cJSON_GetObjectItemCaseSensitive(audio, "codec")) && cJSON_IsNumber(item)) {
             codec_id = item->valueint;
+        }
+        /* "tls":{"skip_cn_check":true} — IP 直连时跳过 CN/SAN 主机名校验
+         * (CA 验签始终进行); "aes256_only":true — 强制 AES-256-GCM */
+        const cJSON *tlsj = cJSON_GetObjectItemCaseSensitive(ws, "tls");
+        if (tlsj && (item = cJSON_GetObjectItemCaseSensitive(tlsj, "skip_cn_check"))
+                && cJSON_IsBool(item)) {
+            e->tls_skip_cn = cJSON_IsTrue(item) ? 1 : 0;
+        }
+        if (tlsj && (item = cJSON_GetObjectItemCaseSensitive(tlsj, "aes256_only"))
+                && cJSON_IsBool(item)) {
+            e->tls_aes256_only = cJSON_IsTrue(item) ? 1 : 0;
         }
     }
     cJSON_Delete(root);
@@ -461,14 +481,32 @@ int convai_start(convai_engine_t handle, const convai_opt_t *opt)
 
     char host[64], path[32];
     uint16_t port;
-    if (parse_ws_url(e->server_url, host, sizeof(host), &port, path, sizeof(path)) != 0) {
+    if (parse_ws_url(e->server_url, host, sizeof(host), &port, path, sizeof(path),
+                     &e->use_tls) != 0) {
         LOGE("bad url %s\n", e->server_url);
         return CONVAI_ERR_INVALID_PARAM;
     }
-    e->ws = convai_wsc_connect(host, port, path, CONVAI_SUBPROTOCOL);
+    if (e->use_tls) {
+        /* WSS: 内嵌 CA 验签 (TEST 证书见 convai_root_ca.c, 生产请替换) */
+        extern const char g_convai_root_ca_pem[];
+        convai_wsc_tls_t tls = {
+            .ca_pem = g_convai_root_ca_pem,
+            .skip_cn_check = e->tls_skip_cn,
+            .ciphersuites = e->tls_aes256_only ? g_convai_wsc_suites_aes256 : NULL,
+        };
+        e->ws = convai_wsc_connect_ex(host, port, path, CONVAI_SUBPROTOCOL, &tls);
+    } else {
+        e->ws = convai_wsc_connect(host, port, path, CONVAI_SUBPROTOCOL);
+    }
     if (!e->ws) {
-        LOGE("ws connect failed %s:%u%s\n", host, port, path);
+        LOGE("ws%s connect failed %s:%u%s\n", e->use_tls ? "s" : "",
+             host, port, path);
         return CONVAI_ERR_NETWORK;
+    }
+    if (e->use_tls) {
+        LOGI("TLS established: %s (verify=CA%s)\n",
+             convai_wsc_get_ciphersuite(e->ws),
+             e->tls_skip_cn ? ", CN skipped" : "+CN");
     }
 
     e->running = 1;

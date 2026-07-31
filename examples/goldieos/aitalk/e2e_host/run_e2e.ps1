@@ -11,6 +11,9 @@ $out      = "$here\out"
 
 New-Item -ItemType Directory -Force $out | Out-Null
 
+# 清理可能残留的 router/mock 进程 (上次运行异常退出时会占住端口)
+Get-Process -Name router,mockbackends -ErrorAction SilentlyContinue | Stop-Process -Force
+
 # ---- 1. build gateway + mock backends ----
 # Opus needs cgo+libopus (absent on Windows); codec/opus_stub.go covers
 # CGO-less builds 鈥?g711a E2E 涓嶉渶瑕?opus銆?$env:GOPROXY = "https://goproxy.cn,direct"
@@ -31,6 +34,7 @@ $src = @(
     "$goldieos\aitalk\src\convai_ws_client.c",
     "$goldieos\aitalk\src\convai_protocol.c",
     "$goldieos\aitalk\src\convai_ring.c",
+    "$goldieos\aitalk\src\convai_root_ca.c",
     "$goldieos\aitalk\src\convai_codec.c",
     "$goldieos\aitalk\src\convai_codec_g711a.c",
     "$goldieos\aitalk\src\codec_g711.c",
@@ -40,6 +44,7 @@ $src = @(
     "$goldieos\third_party\cjson\cJSON.c",
     "$here\goldie_osal_host.c",
     "$here\net_sockets_host.c",
+    "$here\vsnprintf_s_compat.c",
     "$here\e2e_main.c"
 )
 $inc = @(
@@ -47,10 +52,17 @@ $inc = @(
     "-I$goldieos\aitalk\include",
     "-I$goldieos\include\osal",
     "-I$goldieos\third_party\cjson",
+    "-I$goldieos\include\third_party\mbedtls",
     "-I$repoRoot\include"
 )
+# win10 预编译 mbedTLS (mbedtls 3.1.0, 与 include/third_party/mbedtls 同源)
+$tlslibs = @(
+    "$goldieos\libs\win10\libmbedtls.a",
+    "$goldieos\libs\win10\libmbedx509.a",
+    "$goldieos\libs\win10\libmbedcrypto.a"
+)
 Push-Location $out
-& gcc -std=gnu11 -O1 -g -Wall -Wextra -o e2e_device.exe $src $inc -lws2_32 -lpthread -lm
+& gcc -std=gnu11 -O1 -g -Wall -Wextra -o e2e_device.exe $src $inc $tlslibs -lws2_32 -lpthread -lm -lbcrypt
 if ($LASTEXITCODE) { Pop-Location; exit $LASTEXITCODE }
 Pop-Location
 
@@ -60,10 +72,15 @@ $mock = Start-Process -PassThru -NoNewWindow "$out\mockbackends.exe" `
         -ArgumentList "-asr :51051 -llm :51052 -tts :51061" `
         -RedirectStandardOutput "$out\mock.log" -RedirectStandardError "$out\mock.err"
 Start-Sleep -Milliseconds 800
-Write-Host "== start gateway (:9000) =="
+Write-Host "== start gateway (ws :19000 + wss :19001) =="
 $gw = Start-Process -PassThru -NoNewWindow "$out\router.exe" `
       -ArgumentList "-listen :19000 -asr 127.0.0.1:51051 -llm 127.0.0.1:51052 -tts 127.0.0.1:51061" `
       -RedirectStandardOutput "$out\router.log" -RedirectStandardError "$out\router.err"
+$cert = "$goldieos\aitalk\certs\server_ca.pem"
+$key  = "$goldieos\aitalk\certs\server.key"
+$gws = Start-Process -PassThru -NoNewWindow "$out\router.exe" `
+      -ArgumentList "-listen :19001 -tls-cert `"$cert`" -tls-key `"$key`" -asr 127.0.0.1:51051 -llm 127.0.0.1:51052 -tts 127.0.0.1:51061" `
+      -RedirectStandardOutput "$out\router_wss.log" -RedirectStandardError "$out\router_wss.err"
 Start-Sleep -Milliseconds 800
 
 # ---- 4. run the device simulator ----
@@ -73,9 +90,10 @@ $rc = $LASTEXITCODE
 
 # ---- 5. teardown ----
 Stop-Process -Id $gw.Id   -Force -ErrorAction SilentlyContinue
+Stop-Process -Id $gws.Id  -Force -ErrorAction SilentlyContinue
 Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
-Write-Host "logs: $out\router.log, $out\mock.log"
+Write-Host "logs: $out\router.log, $out\router_wss.log, $out\mock.log"
 exit $rc
 

@@ -15,6 +15,11 @@ extern "C" {
 
 #define MBEDTLS_NET_PROTO_TCP   0
 #define MBEDTLS_ERR_NET_CONN_RESET  (-0x0050)
+/* 与真实 mbedtls ssl.h 同值: 阻塞 socket 超时报 WANT_READ,
+ * 使 TLS 层 (mbedtls_ssl_read) 与 poll 超时逻辑正常工作 */
+#ifndef MBEDTLS_ERR_SSL_WANT_READ
+#define MBEDTLS_ERR_SSL_WANT_READ   (-0x6900)
+#endif
 
 typedef struct {
     int fd;
