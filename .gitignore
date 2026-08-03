@@ -12,3 +12,6 @@ cloud_gateway/build/
 *.dylib
 *.gcno
 *.gcda
+.opencode/
+examples/goldieos/aitalk/e2e_host/out/
+examples/goldieos/build_open/
